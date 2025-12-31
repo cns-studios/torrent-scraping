@@ -1,36 +1,60 @@
 # Torrent Scraping Tool
 
-## Setup
-Make sure you have `rust`, `cargo`, `rustc` and `rustup` installed. On Linux Debian Systems, this usually works with `apt install`:
-```bash
-sudo apt update -y && sudo apt install rust-all rustup && rustup default stable
-```
-Other Systems wherent tested yet. If you run into any issues, please open an Github Issue and tell us how you fixed it (if you did). 
+A cross-platform toolkit for extracting magnet links from websites and downloading torrents.
 
-**If you still run into any errors** try updating rust:
+## Setup
+
+### Prerequisites
+- Rust 1.82.0 or newer
+- Cargo, rustc, and rustup
+
+### Linux (Debian/Ubuntu)
 ```bash
-cargo update && rustup update
+sudo apt update -y && sudo apt install rustup -y
+rustup default stable
 ```
+
+### Windows
+```powershell
+winget install Rustlang.Rustup
+rustup default stable
+```
+
+> **Note:** Visual Studio Build Tools are **not required** - this project uses `rustls` for TLS, avoiding native library dependencies.
+
+### macOS
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup default stable
+```
+
+### Troubleshooting
+If you run into build errors, try updating:
+```bash
+rustup update && cargo update
+```
+
+---
 
 ## Extract
-To **extract** `magnet links` from any site you want, use the `extract` tool (in the `extract` crate). The following args are supported:
 
-> **Note:** this project requires **rustc 1.82.0 or newer**. If not properly configured, building will fail.
+Extracts magnet links from websites. Supports both HTML scraping and JSON API parsing (e.g., TPB's apibay.org).
 
-**Build the Extractor first**
+### Build
 ```bash
-cd extract/
-cargo build --release
+cargo build --release -p extract
 ```
 
-**Run from the crate**:
+### Usage
+
+**Basic usage:**
 ```bash
-cargo run --bin extract -- --domain example.com
+./target/release/extract --domain example.com
 ```
 
-**Run with Custom parameters**
+**With custom parameters:**
 ```bash
-cargo run --bin extract -- \
+./target/release/extract \
   --domain example.com \
   --max-links 500 \
   --concurrent 20 \
@@ -39,36 +63,123 @@ cargo run --bin extract -- \
   --output my_torrents.json
 ```
 
-> **Important** Copy the newly created `torrents.json` file from the `extract/` crate into the ``scrape/` crate if you want to use it for scraping.
+**For API-based sites (like TPB):**
+```bash
+# TPB uses JavaScript - hit the API directly
+./target/release/extract --domain "https://apibay.org/q.php?q=ubuntu&cat=200" --max-links 50
+```
+
+### Command Line Options
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--domain` | `-d` | required | Domain or URL to scrape |
+| `--max-links` | `-m` | 100 | Maximum magnet links to collect |
+| `--concurrent` | `-c` | 10 | Number of concurrent connections |
+| `--max-depth` | `-D` | 3 | Maximum crawl depth (0 = starting page only) |
+| `--timeout` | `-t` | 30 | Request timeout in seconds |
+| `--output` | `-o` | torrents.json | Output file path |
+
+### Output Format
+```json
+{
+  "torrents": [
+    {
+      "name": "Example Torrent",
+      "magnet": "magnet:?xt=urn:btih:...",
+      "size": 1234567890,
+      "seeders": 100,
+      "leechers": 50
+    }
+  ]
+}
+```
+
+---
 
 ## Scraper
 
-**Build the Scraper first**:
-````bash
-cargo build --release
+Downloads torrents from magnet links and optionally archives them with 7-Zip.
+
+### Build
+```bash
+cargo build --release -p scrape
 ```
 
-To run the scraper, edit the `config.toml` file to your preferences and build/run the `scrape` crate:
+### Usage
+1. Copy `torrents.json` from extract output to the `scrape/` directory (or configure path in `config.toml`)
+2. Edit `scrape/config.toml` to your preferences
+3. Run the scraper:
 
-**Run From the crate**:
 ```bash
 cd scrape/
-cargo build --release
-cargo run
+cargo run --release
 ```
 
+### Configuration
+
+Edit `config.toml` to customize behavior. Key settings:
+
+```toml
+# Path to torrent list (supports extract's output format)
+torrent_list = "torrents.json"
+
+[download]
+max_concurrent = 4          # Simultaneous downloads
+download_dir = "./downloads"
+timeout = 300               # Connection timeout (seconds)
+
+[archive]
+enabled = true              # Auto-archive completed downloads
+archive_dir = "./archives"
+compression_level = 0       # 0=store (best for video), 9=ultra
+delete_after_archive = true
+```
+
+### Input Format
+Accepts both formats:
+
+**Simple (array of magnet strings):**
+```json
+{ "torrents": ["magnet:?xt=urn:btih:...", "magnet:?xt=urn:btih:..."] }
+```
+
+**Detailed (extract output):**
+```json
+{ "torrents": [{ "magnet": "magnet:?xt=urn:btih:...", "name": "..." }] }
+```
+
+---
 
 ## Features
 
-### Extractor:
-- Concurrent crawling with configurable connection limit
-- Depth-limited crawling to avoid going too deep
+### Extractor
+- Cross-platform (Windows, Linux, macOS) - no native SSL dependencies
+- Concurrent crawling with configurable connection limits
+- Depth-limited crawling to control scope
 - Domain-scoped - only follows links within the specified domain
 - Duplicate prevention - tracks visited URLs and unique magnets
-- Regex-based magnet extraction from page source and HTML
+- JSON API parsing - extracts info_hash from API responses (TPB, etc.)
+- Regex-based magnet extraction from HTML source
+- Rich metadata extraction (name, size, seeders, leechers)
 - Progress logging via tracing
 - Configurable timeout for requests
-- Auto-saves to torrents.json in your specified format
 
 ### Scraper
-~~Add Features here~~
+- Cross-platform (Windows, Linux, macOS) - pure Rust TLS
+- Concurrent downloads with configurable limits
+- Magnet link and .torrent file support
+- Automatic 7-Zip archiving (requires 7z in PATH)
+- Configurable compression (0=store for video, 1-9 for compression)
+- State persistence - resume interrupted sessions
+- Progress tracking and logging
+- Graceful shutdown on Ctrl+C
+- Flexible input format - accepts both simple and detailed JSON
+- Split archive support for large files
+- Archive verification after creation
+
+---
+
+## License
+
+See [LICENSE](LICENSE) for details.

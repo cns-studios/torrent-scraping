@@ -10,7 +10,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -43,7 +43,29 @@ struct Args {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct TorrentData {
-    torrents: Vec<String>,
+    torrents: Vec<TorrentInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct TorrentInfo {
+    name: String,
+    magnet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seeders: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leechers: Option<u32>,
+}
+
+// For parsing TPB-style API responses
+#[derive(Deserialize, Debug)]
+struct ApiTorrent {
+    name: Option<String>,
+    info_hash: Option<String>,
+    size: Option<String>,
+    seeders: Option<String>,
+    leechers: Option<String>,
 }
 
 struct Scraper {
@@ -51,7 +73,9 @@ struct Scraper {
     domain: String,
     visited: Arc<DashSet<String>>,
     magnets: Arc<DashSet<String>>,
+    torrent_info: Arc<DashSet<String>>, // Store serialized TorrentInfo
     magnet_regex: Regex,
+    hash_regex: Regex,
     semaphore: Arc<Semaphore>,
     max_links: usize,
     max_depth: usize,
@@ -61,17 +85,23 @@ impl Scraper {
     fn new(args: &Args) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(args.timeout))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .build()?;
 
-        let magnet_regex = Regex::new(r#"magnet:\?[^\s<>"']+|magnet:\?[^\s<>'"]+"#).unwrap();
+        // Match magnet links
+        let magnet_regex = Regex::new(r#"magnet:\?xt=urn:btih:[a-fA-F0-9]{40}[^\s<>"']*"#).unwrap();
+
+        // Match standalone info hashes (40 hex chars)
+        let hash_regex = Regex::new(r#"["\s:][0-9A-Fa-f]{40}["\s,\}]"#).unwrap();
 
         Ok(Self {
             client,
             domain: args.domain.clone(),
             visited: Arc::new(DashSet::new()),
             magnets: Arc::new(DashSet::new()),
+            torrent_info: Arc::new(DashSet::new()),
             magnet_regex,
+            hash_regex,
             semaphore: Arc::new(Semaphore::new(args.concurrent)),
             max_links: args.max_links,
             max_depth: args.max_depth,
@@ -91,12 +121,108 @@ impl Scraper {
         None
     }
 
-    fn extract_magnets(&self, html: &str) {
-        for cap in self.magnet_regex.find_iter(html) {
-            let magnet = cap.as_str().to_string();
-            if self.magnets.insert(magnet.clone()) {
-                info!("Found magnet: {}", &magnet[..60.min(magnet.len())]);
+    fn hash_to_magnet(hash: &str, name: Option<&str>) -> String {
+        let hash_upper = hash.to_uppercase();
+        match name {
+            Some(n) => format!(
+                "magnet:?xt=urn:btih:{}&dn={}",
+                hash_upper,
+                urlencoding::encode(n)
+            ),
+            None => format!("magnet:?xt=urn:btih:{}", hash_upper),
+        }
+    }
+
+    fn add_torrent(&self, info: TorrentInfo) -> bool {
+        if self.magnets.insert(info.magnet.clone()) {
+            let serialized = serde_json::to_string(&info).unwrap_or_default();
+            self.torrent_info.insert(serialized);
+            info!("Found: {} - {}",
+                info.name.chars().take(50).collect::<String>(),
+                &info.magnet[..60.min(info.magnet.len())]);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn extract_from_json(&self, text: &str) {
+        // Try to parse as JSON array (TPB API style)
+        if let Ok(torrents) = serde_json::from_str::<Vec<ApiTorrent>>(text) {
+            for t in torrents {
+                if self.magnets.len() >= self.max_links {
+                    break;
+                }
+                if let (Some(hash), Some(name)) = (&t.info_hash, &t.name) {
+                    if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                        let magnet = Self::hash_to_magnet(hash, Some(name));
+                        let info = TorrentInfo {
+                            name: name.clone(),
+                            magnet,
+                            size: t.size.as_ref().and_then(|s| s.parse().ok()),
+                            seeders: t.seeders.as_ref().and_then(|s| s.parse().ok()),
+                            leechers: t.leechers.as_ref().and_then(|s| s.parse().ok()),
+                        };
+                        self.add_torrent(info);
+                    }
+                }
             }
+            return;
+        }
+
+        // Try to find info_hash fields in JSON-like content
+        if text.contains("info_hash") {
+            for cap in self.hash_regex.find_iter(text) {
+                if self.magnets.len() >= self.max_links {
+                    break;
+                }
+                let matched = cap.as_str();
+                let hash = matched.trim_matches(|c| c == '"' || c == ':' || c == ' ' || c == ',' || c == '}');
+                if hash.len() == 40 {
+                    let magnet = Self::hash_to_magnet(hash, None);
+                    let info = TorrentInfo {
+                        name: format!("Unknown ({})", &hash[..8]),
+                        magnet,
+                        size: None,
+                        seeders: None,
+                        leechers: None,
+                    };
+                    self.add_torrent(info);
+                }
+            }
+        }
+    }
+
+    fn extract_magnets(&self, text: &str) {
+        // First try JSON extraction
+        self.extract_from_json(text);
+
+        // Then look for direct magnet links
+        for cap in self.magnet_regex.find_iter(text) {
+            if self.magnets.len() >= self.max_links {
+                break;
+            }
+            let magnet = cap.as_str().to_string();
+
+            // Try to extract name from magnet link
+            let name = if let Some(dn_start) = magnet.find("&dn=") {
+                let name_part = &magnet[dn_start + 4..];
+                let name_end = name_part.find('&').unwrap_or(name_part.len());
+                urlencoding::decode(&name_part[..name_end])
+                    .map(|s| s.into_owned())
+                    .unwrap_or_else(|_| "Unknown".to_string())
+            } else {
+                "Unknown".to_string()
+            };
+
+            let info = TorrentInfo {
+                name,
+                magnet,
+                size: None,
+                seeders: None,
+                leechers: None,
+            };
+            self.add_torrent(info);
         }
     }
 
@@ -118,10 +244,10 @@ impl Scraper {
 
     async fn fetch_page(&self, url: &str) -> Result<String> {
         let _permit = self.semaphore.acquire().await?;
-        
+
         let response = self.client.get(url).send().await?;
         let status = response.status();
-        
+
         if !status.is_success() {
             anyhow::bail!("HTTP {}: {}", status, url);
         }
@@ -146,9 +272,9 @@ impl Scraper {
         info!("Crawling [depth {}]: {}", depth, url);
 
         match self.fetch_page(&url).await {
-            Ok(html) => {
-                self.extract_magnets(&html);
-                Ok(self.extract_links(&html, &url))
+            Ok(content) => {
+                self.extract_magnets(&content);
+                Ok(self.extract_links(&content, &url))
             }
             Err(e) => {
                 warn!("Failed to fetch {}: {}", url, e);
@@ -162,7 +288,7 @@ impl Scraper {
 
         while !queue.is_empty() && self.magnets.len() < self.max_links {
             let batch: Vec<_> = queue.drain(..).collect();
-            
+
             let results = stream::iter(batch)
                 .map(|(url, depth)| {
                     let scraper = self.clone_refs();
@@ -184,7 +310,7 @@ impl Scraper {
                 }
             }
 
-            info!("Progress: {} magnets found, {} URLs visited", 
+            info!("Progress: {} magnets found, {} URLs visited",
                   self.magnets.len(), self.visited.len());
         }
 
@@ -197,7 +323,9 @@ impl Scraper {
             domain: self.domain.clone(),
             visited: Arc::clone(&self.visited),
             magnets: Arc::clone(&self.magnets),
+            torrent_info: Arc::clone(&self.torrent_info),
             magnet_regex: self.magnet_regex.clone(),
+            hash_regex: self.hash_regex.clone(),
             semaphore: Arc::clone(&self.semaphore),
             max_links: self.max_links,
             max_depth: self.max_depth,
@@ -205,13 +333,17 @@ impl Scraper {
     }
 
     fn save_results(&self, output_path: &str) -> Result<()> {
-        let torrents: Vec<String> = self.magnets.iter().map(|m| m.clone()).collect();
+        let torrents: Vec<TorrentInfo> = self.torrent_info
+            .iter()
+            .filter_map(|s| serde_json::from_str(&s).ok())
+            .collect();
+
         let data = TorrentData { torrents };
-        
+
         let json = serde_json::to_string_pretty(&data)?;
         fs::write(output_path, json)
             .context(format!("Failed to write to {}", output_path))?;
-        
+
         info!("Saved {} magnet links to {}", data.torrents.len(), output_path);
         Ok(())
     }
@@ -222,13 +354,13 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    
+
     info!("Starting magnet link extraction from domain: {}", args.domain);
-    info!("Max links: {}, Concurrent: {}, Max depth: {}", 
+    info!("Max links: {}, Concurrent: {}, Max depth: {}",
           args.max_links, args.concurrent, args.max_depth);
 
     let scraper = Scraper::new(&args)?;
-    
+
     // Try both http and https
     let start_url = if args.domain.starts_with("http") {
         args.domain.clone()
@@ -240,6 +372,6 @@ async fn main() -> Result<()> {
     scraper.save_results(&args.output)?;
 
     info!("Extraction complete! Found {} magnet links", scraper.magnets.len());
-    
+
     Ok(())
 }

@@ -1,20 +1,16 @@
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::time::Duration;
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::time;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
@@ -75,9 +71,34 @@ struct LoggingConfig {
     log_file: String,
 }
 
+// Flexible torrent list - supports both string arrays and object arrays
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TorrentItem {
+    Simple(String),
+    Detailed(DetailedTorrent),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DetailedTorrent {
+    #[serde(alias = "link")]
+    magnet: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct TorrentList {
-    torrents: Vec<String>,
+    torrents: Vec<TorrentItem>,
+}
+
+impl TorrentItem {
+    fn into_link(self) -> String {
+        match self {
+            TorrentItem::Simple(s) => s,
+            TorrentItem::Detailed(d) => d.magnet,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -292,23 +313,27 @@ impl SimpleTorrentClient {
 
     fn calculate_info_hash(torrent_data: &[u8]) -> Result<[u8; 20]> {
         use sha1::{Digest, Sha1};
-        
-        // Parse bencode to find info dictionary
-        let decoded: bencode::BencodeValue = bencode::from_bytes(torrent_data)?;
-        
-        if let bencode::BencodeValue::Dict(dict) = decoded {
-            if let Some(info) = dict.get(b"info") {
-                let info_bytes = bencode::to_bytes(info)?;
-                let mut hasher = Sha1::new();
-                hasher.update(&info_bytes);
-                let result = hasher.finalize();
-                let mut hash = [0u8; 20];
-                hash.copy_from_slice(&result);
-                return Ok(hash);
-            }
+
+        // Torrent file structure for parsing
+        #[derive(Debug, Deserialize)]
+        struct TorrentFile {
+            info: serde_bencode::value::Value,
         }
-        
-        anyhow::bail!("Invalid torrent file format");
+
+        // Parse the torrent file
+        let torrent: TorrentFile = serde_bencode::from_bytes(torrent_data)
+            .context("Failed to parse torrent file")?;
+
+        // Re-encode the info dictionary to get its bytes for hashing
+        let info_bytes = serde_bencode::to_bytes(&torrent.info)
+            .context("Failed to encode info dictionary")?;
+
+        let mut hasher = Sha1::new();
+        hasher.update(&info_bytes);
+        let result = hasher.finalize();
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&result);
+        Ok(hash)
     }
 
     async fn download(&self) -> Result<PathBuf> {
@@ -436,7 +461,8 @@ impl App {
         let torrent_entries: Vec<TorrentEntry> = torrent_list
             .torrents
             .into_iter()
-            .filter_map(|link| {
+            .filter_map(|item| {
+                let link = item.into_link();
                 match TorrentEntry::from_link(link.clone()) {
                     Ok(entry) => Some(entry),
                     Err(e) => {

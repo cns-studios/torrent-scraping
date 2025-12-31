@@ -1,7 +1,8 @@
 torrents.json
-./archives
-./downloads
-./temp
+archives/
+downloads/
+temp/
 state.json
 scraper.log
 target/
+.claude/

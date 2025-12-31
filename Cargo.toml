@@ -1,2 +1,3 @@
 [workspace]
 members = ["extract", "scrape"]
+resolver = "2"
