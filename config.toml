@@ -1,0 +1,78 @@
+# Torrent Scraper Configuration
+
+# Path to the JSON file containing torrent links
+torrent_list = "torrents.json"
+
+# Download settings
+[download]
+# Maximum concurrent downloads
+max_concurrent = 4
+# Download directory
+download_dir = "./downloads"
+# Temporary directory for incomplete downloads
+temp_dir = "./temp"
+# Connection timeout in seconds
+timeout = 300
+# Maximum download speed in KB/s (0 = unlimited)
+max_download_speed = 0
+# Maximum upload speed in KB/s (set to 1 for minimal seeding)
+max_upload_speed = 1
+# Stop seeding after download completes
+seed_after_download = false
+# Maximum connections per torrent
+max_connections_per_torrent = 200
+# Maximum peers per torrent
+max_peers = 100
+# DHT enabled (helps find peers without trackers)
+dht_enabled = true
+# PEX enabled (peer exchange)
+pex_enabled = true
+
+# Archive settings
+[archive]
+# Enable automatic archiving after download
+enabled = true
+# Archive directory
+archive_dir = "./archives"
+# Compression level for 7zip (0=store/copy, 1=fastest, 5=normal, 9=ultra)
+# For video: 0 recommended (already compressed, no benefit from recompression)
+compression_level = 0
+# Delete original files after archiving
+delete_after_archive = true
+# Solid archive mode (better compression ratio but slower)
+solid_mode = false
+# Number of CPU threads for 7zip (0 = auto-detect)
+threads = 0
+# Split archive size in MB (0 = no split, useful for large video files)
+split_size_mb = 0
+# Video-specific: preserve directory structure
+preserve_structure = true
+# Verify archive after creation
+verify_after_create = true
+
+# State management
+[state]
+# File to track progress
+state_file = "state.json"
+# Save state every N seconds
+save_interval = 30
+
+# Performance tuning
+[performance]
+# Archive queue size (how many completed downloads wait for archiving)
+archive_queue_size = 2
+# Disk cache size in MB for torrenting
+disk_cache_mb = 512
+# Read cache line size (for sequential video file reading)
+read_cache_line_kb = 1024
+# Write cache expiry seconds
+write_cache_expiry = 60
+# Optimize for video files (larger sequential reads)
+optimize_for_video = true
+
+# Logging
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+# Log file path
+log_file = "scraper.log"

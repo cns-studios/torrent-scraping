@@ -1,0 +1,7 @@
+{
+  "torrents": [
+    "magnet:?xt=urn:btih:INFOHASH1&dn=Example+File&tr=udp://tracker.example.com:80",
+    "https://example.com/torrent.torrent",
+    "/path/to/local/file.torrent"
+  ]
+}
