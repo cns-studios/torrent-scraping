@@ -99,7 +99,33 @@ cargo build --release -p extract
 
 ## Scraper
 
-Downloads torrents from magnet links and optionally archives them with 7-Zip.
+Downloads torrents from magnet links using aria2c and optionally archives them with 7-Zip.
+
+### Prerequisites
+
+**aria2c** is required for downloading. Install it:
+```bash
+# Windows
+winget install aria2
+
+# Linux (Debian/Ubuntu)
+sudo apt install aria2
+
+# macOS
+brew install aria2
+```
+
+**7-Zip** (optional, for archiving):
+```bash
+# Windows
+winget install 7zip
+
+# Linux
+sudo apt install p7zip-full
+
+# macOS
+brew install p7zip
+```
 
 ### Build
 ```bash
@@ -118,22 +144,28 @@ cargo run --release
 
 ### Configuration
 
-Edit `config.toml` to customize behavior. Key settings:
+Edit `config.toml` to customize behavior:
 
 ```toml
-# Path to torrent list (supports extract's output format)
 torrent_list = "torrents.json"
 
 [download]
 max_concurrent = 4          # Simultaneous downloads
 download_dir = "./downloads"
 timeout = 300               # Connection timeout (seconds)
+# max_download_speed = "10M"  # Optional speed limit
+# max_upload_speed = "100K"   # Optional upload limit
+# seed_ratio = 0.0            # Don't seed after download
 
 [archive]
-enabled = true              # Auto-archive completed downloads
+enabled = false             # Auto-archive completed downloads
 archive_dir = "./archives"
 compression_level = 0       # 0=store (best for video), 9=ultra
-delete_after_archive = true
+delete_after_archive = false
+
+[state]
+state_file = "state.json"   # Resume interrupted sessions
+save_interval = 30
 ```
 
 ### Input Format
@@ -166,17 +198,17 @@ Accepts both formats:
 - Configurable timeout for requests
 
 ### Scraper
-- Cross-platform (Windows, Linux, macOS) - pure Rust TLS
+- Cross-platform (Windows, Linux, macOS)
+- Uses aria2c for fast, reliable BitTorrent downloads
 - Concurrent downloads with configurable limits
-- Magnet link and .torrent file support
-- Automatic 7-Zip archiving (requires 7z in PATH)
-- Configurable compression (0=store for video, 1-9 for compression)
+- DHT, PEX, and local peer discovery enabled
+- No seeding by default (configurable)
+- Speed limiting (upload/download)
+- Automatic 7-Zip archiving (optional, requires 7z)
 - State persistence - resume interrupted sessions
 - Progress tracking and logging
 - Graceful shutdown on Ctrl+C
 - Flexible input format - accepts both simple and detailed JSON
-- Split archive support for large files
-- Archive verification after creation
 
 ---
 
