@@ -1,6 +1,7 @@
 # Torrent Scraping Tool
 
 A cross-platform toolkit for extracting magnet links from websites and downloading torrents.
+**Be sure to enable a VPN Service like `Cloudflare 1.1.1.1` before connecting to any torrents**
 
 ## Setup
 
