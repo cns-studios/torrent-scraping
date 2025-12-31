@@ -362,23 +362,42 @@ impl App {
 
         let mut cmd = Command::new("aria2c");
 
+        // Public trackers to help find peers
+        let default_trackers = [
+            "udp://tracker.opentrackr.org:1337/announce",
+            "udp://open.tracker.cl:1337/announce",
+            "udp://tracker.openbittorrent.com:6969/announce",
+            "udp://open.stealth.si:80/announce",
+            "udp://tracker.torrent.eu.org:451/announce",
+            "udp://exodus.desync.com:6969/announce",
+            "udp://tracker.moeking.me:6969/announce",
+            "udp://explodie.org:6969/announce",
+            "udp://tracker1.bt.moack.co.kr:80/announce",
+            "udp://tracker.theoks.net:6969/announce",
+        ];
+
         // Basic options
         cmd.arg(link)
             .arg("-d").arg(&download_dir)
             .arg("--seed-time=0")  // Don't seed after download
-            .arg("--bt-stop-timeout=300")  // Stop if no progress for 5 min
-            .arg("--summary-interval=10")
+            .arg("--bt-stop-timeout=600")  // Stop if no progress for 10 min
+            .arg("--summary-interval=5")
             .arg("--console-log-level=notice")
             .arg("--download-result=hide")
             .arg("--allow-overwrite=true")
             .arg("--auto-file-renaming=false")
             .arg("--bt-enable-lpd=true")  // Local peer discovery
             .arg("--enable-dht=true")
+            .arg("--dht-listen-port=6881-6999")
             .arg("--enable-peer-exchange=true")
-            .arg("--bt-max-peers=100")
+            .arg("--bt-max-peers=200")
+            .arg("--bt-request-peer-speed-limit=10M")
             .arg("--max-connection-per-server=16")
             .arg("--split=16")
-            .arg("--min-split-size=1M");
+            .arg("--min-split-size=1M")
+            .arg("--bt-tracker-connect-timeout=10")
+            .arg("--bt-tracker-timeout=30")
+            .arg(format!("--bt-tracker={}", default_trackers.join(",")));
 
         // Speed limits
         if let Some(ref max_dl) = config.download.max_download_speed {
