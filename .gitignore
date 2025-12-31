@@ -4,3 +4,4 @@ torrents.json
 ./temp
 state.json
 scraper.log
+target/

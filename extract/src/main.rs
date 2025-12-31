@@ -64,7 +64,7 @@ impl Scraper {
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .build()?;
 
-        let magnet_regex = Regex::new(r"magnet:\?[^\s<>\"']+").unwrap();
+        let magnet_regex = Regex::new(r#"magnet:\?[^\s<>"']+|magnet:\?[^\s<>'"]+"#).unwrap();
 
         Ok(Self {
             client,
