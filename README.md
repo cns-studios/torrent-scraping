@@ -21,8 +21,6 @@ winget install Rustlang.Rustup
 rustup default stable
 ```
 
-> **Note:** Visual Studio Build Tools are **not required** - this project uses `rustls` for TLS, avoiding native library dependencies.
-
 ### macOS
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -98,7 +96,7 @@ cargo build --release -p extract
 
 ---
 
-## Scraper
+# Scrape
 
 Downloads torrents from magnet links using aria2c and optionally archives them with 7-Zip.
 
@@ -210,9 +208,3 @@ Accepts both formats:
 - Progress tracking and logging
 - Graceful shutdown on Ctrl+C
 - Flexible input format - accepts both simple and detailed JSON
-
----
-
-## License
-
-See [LICENSE](LICENSE) for details.
