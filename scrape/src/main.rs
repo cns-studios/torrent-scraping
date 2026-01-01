@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -105,6 +106,12 @@ struct App {
     state: Arc<RwLock<AppState>>,
     status_map: Arc<DashMap<String, TorrentStatus>>,
     shutdown: Arc<AtomicBool>,
+    // Progress tracking
+    total_torrents: Arc<AtomicUsize>,
+    completed_torrents: Arc<AtomicUsize>,
+    completed_bytes: Arc<AtomicU64>,
+    // Track in-progress downloads: link -> current bytes
+    active_downloads: Arc<DashMap<String, u64>>,
 }
 
 impl App {
@@ -121,7 +128,36 @@ impl App {
             state: Arc::new(RwLock::new(state)),
             status_map,
             shutdown: Arc::new(AtomicBool::new(false)),
+            total_torrents: Arc::new(AtomicUsize::new(0)),
+            completed_torrents: Arc::new(AtomicUsize::new(0)),
+            completed_bytes: Arc::new(AtomicU64::new(0)),
+            active_downloads: Arc::new(DashMap::new()),
         })
+    }
+
+    fn get_total_bytes(&self) -> u64 {
+        let completed = self.completed_bytes.load(Ordering::Relaxed);
+        let active: u64 = self.active_downloads.iter().map(|e| *e.value()).sum();
+        completed + active
+    }
+
+    fn format_bytes(bytes: u64) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+        const TB: u64 = GB * 1024;
+
+        if bytes >= TB {
+            format!("{:.2} TB", bytes as f64 / TB as f64)
+        } else if bytes >= GB {
+            format!("{:.2} GB", bytes as f64 / GB as f64)
+        } else if bytes >= MB {
+            format!("{:.2} MB", bytes as f64 / MB as f64)
+        } else if bytes >= KB {
+            format!("{:.2} KB", bytes as f64 / KB as f64)
+        } else {
+            format!("{} B", bytes)
+        }
     }
 
     fn load_state(path: &str) -> Result<AppState> {
@@ -180,7 +216,13 @@ impl App {
             .map(|item| item.into_link())
             .collect();
 
-        info!("Loaded {} torrents", links.len());
+        // Count pending torrents
+        let pending_count = links.iter().filter(|link| {
+            self.status_map.get(*link).map(|s| *s != TorrentStatus::Downloaded && *s != TorrentStatus::Archived).unwrap_or(true)
+        }).count();
+
+        self.total_torrents.store(pending_count, Ordering::Relaxed);
+        info!("Loaded {} torrents ({} pending)", links.len(), pending_count);
 
         // Initialize state for new torrents
         {
@@ -200,6 +242,37 @@ impl App {
         }
         self.save_state().await?;
 
+        // Create progress bar
+        let progress_bar = ProgressBar::new(pending_count as u64);
+        progress_bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} torrents | {msg}")
+                .unwrap()
+                .progress_chars("█▓▒░  ")
+        );
+        progress_bar.set_message("0 B downloaded");
+
+        // Start progress bar updater
+        let pb_clone = progress_bar.clone();
+        let completed = self.completed_torrents.clone();
+        let completed_bytes = self.completed_bytes.clone();
+        let active_downloads = self.active_downloads.clone();
+        let shutdown_pb = self.shutdown.clone();
+        let progress_updater = tokio::spawn(async move {
+            loop {
+                if shutdown_pb.load(Ordering::Relaxed) {
+                    break;
+                }
+                let done = completed.load(Ordering::Relaxed);
+                let completed_b = completed_bytes.load(Ordering::Relaxed);
+                let active_b: u64 = active_downloads.iter().map(|e| *e.value()).sum();
+                let total_b = completed_b + active_b;
+                pb_clone.set_position(done as u64);
+                pb_clone.set_message(format!("{} downloaded", Self::format_bytes(total_b)));
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+
         // Start state saver
         let state_saver = self.spawn_state_saver();
 
@@ -217,13 +290,18 @@ impl App {
         // Wait for shutdown or completion
         tokio::select! {
             _ = signal::ctrl_c() => {
+                progress_bar.finish_with_message("Interrupted");
                 info!("Shutdown signal received...");
                 self.shutdown.store(true, Ordering::Relaxed);
             }
             _ = download_task => {
+                let bytes = self.get_total_bytes();
+                progress_bar.finish_with_message(format!("Done! {} total", Self::format_bytes(bytes)));
                 info!("All downloads completed");
             }
         }
+
+        progress_updater.abort();
 
         // Cleanup
         state_saver.abort();
@@ -297,6 +375,9 @@ impl App {
         let config = self.config.clone();
         let status_map = self.status_map.clone();
         let shutdown = self.shutdown.clone();
+        let completed_torrents = self.completed_torrents.clone();
+        let completed_bytes = self.completed_bytes.clone();
+        let active_downloads = self.active_downloads.clone();
 
         tokio::spawn(async move {
             let semaphore = Arc::new(Semaphore::new(config.download.max_concurrent));
@@ -320,23 +401,33 @@ impl App {
                 let status_map = status_map.clone();
                 let shutdown = shutdown.clone();
                 let archive_tx = archive_tx.clone();
+                let completed_torrents = completed_torrents.clone();
+                let completed_bytes = completed_bytes.clone();
+                let active_downloads = active_downloads.clone();
 
                 let handle = tokio::spawn(async move {
                     let name = Self::extract_name(&link);
                     info!("Starting download: {}", name);
                     status_map.insert(link.clone(), TorrentStatus::Downloading);
+                    active_downloads.insert(link.clone(), 0);
 
-                    match Self::download_with_aria2c(&link, &config, &shutdown).await {
-                        Ok(path) => {
-                            info!("Completed: {}", name);
+                    match Self::download_with_aria2c(&link, &config, &shutdown, &active_downloads).await {
+                        Ok((path, bytes)) => {
+                            info!("✓ Completed: {} ({})", name, Self::format_bytes(bytes));
+                            active_downloads.remove(&link);
                             status_map.insert(link.clone(), TorrentStatus::Downloaded);
+                            completed_torrents.fetch_add(1, Ordering::Relaxed);
+                            completed_bytes.fetch_add(bytes, Ordering::Relaxed);
                             let _ = archive_tx.send((name, path)).await;
                         }
                         Err(e) => {
+                            let partial = active_downloads.get(&link).map(|v| *v).unwrap_or(0);
+                            active_downloads.remove(&link);
                             if shutdown.load(Ordering::Relaxed) {
-                                warn!("Download interrupted: {}", name);
+                                warn!("⏸ Interrupted: {} ({})", name, Self::format_bytes(partial));
                             } else {
-                                error!("Failed {}: {}", name, e);
+                                error!("✗ Failed: {} - {}", name, e);
+                                error!("  Reason: {}", Self::get_failure_reason(&e));
                                 status_map.insert(link.clone(), TorrentStatus::Failed);
                             }
                         }
@@ -357,8 +448,10 @@ impl App {
         link: &str,
         config: &Config,
         shutdown: &Arc<AtomicBool>,
-    ) -> Result<PathBuf> {
+        active_downloads: &Arc<DashMap<String, u64>>,
+    ) -> Result<(PathBuf, u64)> {
         let download_dir = PathBuf::from(&config.download.download_dir);
+        let link_key = link.to_string();
 
         let mut cmd = Command::new("aria2c");
 
@@ -381,7 +474,7 @@ impl App {
             .arg("-d").arg(&download_dir)
             .arg("--seed-time=0")  // Don't seed after download
             .arg("--bt-stop-timeout=600")  // Stop if no progress for 10 min
-            .arg("--summary-interval=5")
+            .arg("--summary-interval=1")  // More frequent updates
             .arg("--console-log-level=notice")
             .arg("--download-result=hide")
             .arg("--allow-overwrite=true")
@@ -397,6 +490,7 @@ impl App {
             .arg("--min-split-size=1M")
             .arg("--bt-tracker-connect-timeout=10")
             .arg("--bt-tracker-timeout=30")
+            .arg("--human-readable=false")  // Machine-readable byte counts
             .arg(format!("--bt-tracker={}", default_trackers.join(",")));
 
         // Speed limits
@@ -427,15 +521,73 @@ impl App {
 
         let mut child = cmd.spawn().context("Failed to spawn aria2c")?;
 
-        let stdout = child.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout).lines();
+        // aria2c outputs progress to stderr, not stdout
+        let stderr = child.stderr.take().unwrap();
+        let mut reader = BufReader::new(stderr).lines();
 
-        // Monitor output
+        // Monitor output and parse download size
         let shutdown_clone = shutdown.clone();
+        let active_clone = active_downloads.clone();
+        let link_clone = link_key.clone();
+        let current_bytes = Arc::new(AtomicU64::new(0));
+        let bytes_clone = current_bytes.clone();
+        let download_dir_clone = download_dir.clone();
         let monitor = tokio::spawn(async move {
+            let mut last_scan = std::time::Instant::now();
             while let Ok(Some(line)) = reader.next_line().await {
-                if line.contains("[#") || line.contains("Download complete") {
-                    info!("{}", line);
+                // Strip ANSI escape codes
+                let clean_line = Self::strip_ansi(&line);
+
+                // Parse size from aria2c output
+                // With --human-readable=false, format is like: "[#abc123 1234567/9876543(12%)"
+                // With human-readable, format is like: "[#abc123 1.2GiB/3.5GiB(34%)"
+                if clean_line.contains("[#") {
+                    let mut found = false;
+
+                    // Try to extract downloaded size - format is "SIZE/TOTAL" or "SIZE/TOTAL(percent%)"
+                    for part in clean_line.split_whitespace() {
+                        if part.contains('/') && !part.starts_with('[') && !part.contains("FILE:") {
+                            // Remove percent suffix if present: "123/456(50%)" -> "123/456"
+                            let clean_part = if let Some(paren_pos) = part.find('(') {
+                                &part[..paren_pos]
+                            } else {
+                                part
+                            };
+
+                            if let Some(slash_pos) = clean_part.find('/') {
+                                let downloaded = &clean_part[..slash_pos];
+                                // Try parsing as raw bytes first (--human-readable=false)
+                                if let Ok(bytes) = downloaded.parse::<u64>() {
+                                    if bytes > 0 {
+                                        bytes_clone.store(bytes, Ordering::Relaxed);
+                                        active_clone.insert(link_clone.clone(), bytes);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                // Fallback to human-readable format (e.g., "1.2GiB")
+                                if let Some(bytes) = Self::parse_size(downloaded) {
+                                    if bytes > 0 {
+                                        bytes_clone.store(bytes, Ordering::Relaxed);
+                                        active_clone.insert(link_clone.clone(), bytes);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If parsing failed but we're downloading, scan directory every 2 seconds
+                    if !found && last_scan.elapsed() > Duration::from_secs(2) {
+                        if let Ok(size) = Self::get_dir_size(&download_dir_clone) {
+                            if size > 0 {
+                                bytes_clone.store(size, Ordering::Relaxed);
+                                active_clone.insert(link_clone.clone(), size);
+                            }
+                        }
+                        last_scan = std::time::Instant::now();
+                    }
                 }
             }
         });
@@ -446,8 +598,17 @@ impl App {
                 status = child.wait() => {
                     monitor.abort();
                     let status = status?;
+                    let final_bytes = current_bytes.load(Ordering::Relaxed);
+
+                    // If we didn't capture bytes during download, check directory size
+                    let bytes = if final_bytes == 0 {
+                        Self::get_dir_size(&download_dir).unwrap_or(0)
+                    } else {
+                        final_bytes
+                    };
+
                     if status.success() {
-                        return Ok(download_dir);
+                        return Ok((download_dir, bytes));
                     } else {
                         anyhow::bail!("aria2c exited with status: {}", status);
                     }
@@ -459,6 +620,90 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    fn parse_size(s: &str) -> Option<u64> {
+        let s = s.trim();
+        let (num_str, multiplier) = if s.ends_with("GiB") {
+            (&s[..s.len()-3], 1024u64 * 1024 * 1024)
+        } else if s.ends_with("MiB") {
+            (&s[..s.len()-3], 1024u64 * 1024)
+        } else if s.ends_with("KiB") {
+            (&s[..s.len()-3], 1024u64)
+        } else if s.ends_with("B") {
+            (&s[..s.len()-1], 1u64)
+        } else {
+            return None;
+        };
+        num_str.parse::<f64>().ok().map(|n| (n * multiplier as f64) as u64)
+    }
+
+    /// Strip ANSI escape codes from a string
+    fn strip_ansi(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Skip escape sequence: ESC [ ... letter
+                if chars.peek() == Some(&'[') {
+                    chars.next(); // consume '['
+                    // Consume until we hit a letter (the terminator)
+                    while let Some(&next) = chars.peek() {
+                        chars.next();
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
+
+    fn get_dir_size(path: &Path) -> Result<u64> {
+        let mut total = 0u64;
+        if path.is_dir() {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    total += Self::get_dir_size(&path)?;
+                } else {
+                    total += entry.metadata()?.len();
+                }
+            }
+        } else if path.is_file() {
+            total = fs::metadata(path)?.len();
+        }
+        Ok(total)
+    }
+
+    fn get_failure_reason(err: &anyhow::Error) -> &'static str {
+        let msg = err.to_string().to_lowercase();
+        if msg.contains("timeout") || msg.contains("timed out") {
+            "Connection timed out - no peers found or slow network"
+        } else if msg.contains("no peer") || msg.contains("0 seeder") {
+            "No seeders available for this torrent"
+        } else if msg.contains("metadata") {
+            "Could not fetch torrent metadata - torrent may be dead"
+        } else if msg.contains("cancelled") || msg.contains("interrupted") {
+            "Download was cancelled by user"
+        } else if msg.contains("exit") && msg.contains("7") {
+            "aria2c error: No peers/seeders found after timeout"
+        } else if msg.contains("exit") && msg.contains("3") {
+            "aria2c error: Resource not found"
+        } else if msg.contains("exit") && msg.contains("24") {
+            "aria2c error: HTTP authorization failed"
+        } else if msg.contains("disk") || msg.contains("space") {
+            "Disk full or write error"
+        } else if msg.contains("permission") {
+            "Permission denied - check folder access"
+        } else {
+            "Unknown error - check if torrent is still active"
         }
     }
 
